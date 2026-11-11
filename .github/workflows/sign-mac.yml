@@ -1,0 +1,120 @@
+# Signs and notarizes the two Mac downloads of a release, then puts the signed zips back on
+# that release (same file names, so empirestudios.app/download picks them up). Run it from
+# GitHub: Actions > Sign Mac downloads > Run workflow.
+#
+# Repo secrets it needs (Settings > Secrets and variables > Actions), added by Jake:
+#   MAC_CERT_P12          base64 of the "Developer ID Application" certificate exported as .p12
+#   MAC_CERT_PASSWORD     the password chosen when exporting the .p12
+#   ASC_KEY_P8            base64 of the App Store Connect API key file (AuthKey_XXXX.p8)
+#   ASC_KEY_ID            that key's Key ID
+#   ASC_ISSUER_ID         the Issuer ID shown above the keys list
+name: Sign Mac downloads
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag (leave empty for the latest release)
+        required: false
+        default: ""
+permissions:
+  contents: write
+jobs:
+  sign:
+    runs-on: macos-14
+    timeout-minutes: 90
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Pick the release
+        run: |
+          TAG="${{ inputs.tag }}"
+          [ -n "$TAG" ] || TAG=$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName -q .tagName)
+          echo "TAG=$TAG" >> "$GITHUB_ENV"; echo "Release: $TAG"
+
+      - name: Download the Mac zips
+        run: |
+          mkdir -p in
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" -p 'EmpireStudios-Mac-*.zip' -D in
+          ls -la in
+
+      - name: Load the signing certificate and notary key
+        env:
+          MAC_CERT_P12: ${{ secrets.MAC_CERT_P12 }}
+          MAC_CERT_PASSWORD: ${{ secrets.MAC_CERT_PASSWORD }}
+          ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
+        run: |
+          KC="$RUNNER_TEMP/sign.keychain-db"; KCPW=$(uuidgen)
+          echo "$MAC_CERT_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security create-keychain -p "$KCPW" "$KC"
+          security set-keychain-settings -lut 7200 "$KC"
+          security unlock-keychain -p "$KCPW" "$KC"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KC" -P "$MAC_CERT_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KCPW" "$KC" >/dev/null
+          security list-keychains -d user -s "$KC" $(security list-keychains -d user | tr -d '"')
+          ID=$(security find-identity -v -p codesigning "$KC" | grep "Developer ID Application" | head -1 | sed -E 's/.*"(.*)".*/\1/')
+          [ -n "$ID" ] || { echo "No Developer ID Application certificate in MAC_CERT_P12"; exit 1; }
+          echo "IDENTITY=$ID" >> "$GITHUB_ENV"; echo "Signing as: $ID"
+          echo "$ASC_KEY_P8" | base64 --decode > "$RUNNER_TEMP/asc.p8"
+          rm -f "$RUNNER_TEMP/cert.p12"
+
+      - name: Build the launcher
+        run: clang -arch arm64 -arch x86_64 -mmacosx-version-min=11.0 -O2 -o launcher mac/launcher.c
+
+      - name: Sign, notarize and staple
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          for Z in in/EmpireStudios-Mac-*.zip; do
+            NAME=$(basename "$Z"); W="work/${NAME%.zip}"; rm -rf "$W"; mkdir -p "$W"
+            ditto -x -k "$Z" "$W"
+            APP="$W/Empire Studios.app"; C="$APP/Contents"
+            # 1. a real program as the app's main executable (the start-up script moves to Resources)
+            if ! file "$C/MacOS/EmpireStudios" | grep -q Mach-O; then
+              mv "$C/MacOS/EmpireStudios" "$C/Resources/launcher.sh"; chmod 755 "$C/Resources/launcher.sh"
+            fi
+            cp launcher "$C/MacOS/EmpireStudios"; chmod 755 "$C/MacOS/EmpireStudios"
+            xattr -cr "$APP"
+            # 2. sign every program and library inside, deepest first
+            find "$C/Resources" -type f -print0 | while IFS= read -r -d '' f; do
+              if file -b "$f" | grep -q Mach-O; then
+                echo "$(echo "$f" | tr -cd '/' | wc -c) $f"
+              fi
+            done | sort -rn | cut -d' ' -f2- > "$W/machos.txt"
+            echo "$(wc -l < "$W/machos.txt") programs/libraries to sign"
+            while IFS= read -r f; do
+              codesign --force --timestamp --options runtime --entitlements mac/entitlements.plist \
+                --sign "$IDENTITY" "$f" >/dev/null
+            done < "$W/machos.txt"
+            # 3. the app itself
+            codesign --force --timestamp --options runtime --entitlements mac/entitlements.plist \
+              --sign "$IDENTITY" "$APP"
+            codesign --verify --deep --strict --verbose=2 "$APP"
+            # 4. Apple's check (notarization), then attach the ticket
+            ditto -c -k --keepParent "$APP" "$W/notarize.zip"
+            xcrun notarytool submit "$W/notarize.zip" --key "$RUNNER_TEMP/asc.p8" \
+              --key-id "$ASC_KEY_ID" --issuer "$ASC_ISSUER_ID" --wait --output-format json | tee "$W/notary.json"
+            if ! grep -q '"status" *: *"Accepted"' "$W/notary.json"; then
+              SUB=$(sed -E 's/.*"id" *: *"([^"]+)".*/\1/' "$W/notary.json" | head -1)
+              xcrun notarytool log "$SUB" --key "$RUNNER_TEMP/asc.p8" --key-id "$ASC_KEY_ID" --issuer "$ASC_ISSUER_ID" || true
+              echo "Apple did not accept $NAME"; exit 1
+            fi
+            xcrun stapler staple "$APP"
+            spctl -a -vvv -t exec "$APP"
+            # 5. the download zip (ditto keeps the symlinks and the stapled ticket)
+            ditto -c -k --keepParent "$APP" "out/$NAME"
+            ls -la "out/$NAME"
+          done
+
+      - name: Put the signed zips on the release
+        run: gh release upload "$TAG" out/EmpireStudios-Mac-*.zip --repo "$GITHUB_REPOSITORY" --clobber
+
+      - name: Clean up
+        if: always()
+        run: |
+          security delete-keychain "$RUNNER_TEMP/sign.keychain-db" 2>/dev/null || true
+          rm -f "$RUNNER_TEMP/asc.p8"
