@@ -25,12 +25,15 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683   # v4.2.2, pinned
 
       - name: Pick the release
+        env:
+          INPUT_TAG: ${{ inputs.tag }}   # through env, never pasted into the script
         run: |
-          TAG="${{ inputs.tag }}"
+          TAG="$INPUT_TAG"
           [ -n "$TAG" ] || TAG=$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName -q .tagName)
+          if ! printf '%s' "$TAG" | grep -Eq '^[A-Za-z0-9._-]{1,60}$'; then echo "Bad tag: $TAG"; exit 1; fi
           echo "TAG=$TAG" >> "$GITHUB_ENV"; echo "Release: $TAG"
 
       - name: Download the Mac zips
