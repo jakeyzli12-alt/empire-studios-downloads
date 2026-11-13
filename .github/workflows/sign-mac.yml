@@ -33,7 +33,7 @@ jobs:
         run: |
           TAG="$INPUT_TAG"
           [ -n "$TAG" ] || TAG=$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName -q .tagName)
-          if ! printf '%s' "$TAG" | grep -Eq '^[A-Za-z0-9._-]{1,60}$'; then echo "Bad tag: $TAG"; exit 1; fi
+          if [[ ! "$TAG" =~ ^[A-Za-z0-9._-]{1,60}$ ]]; then echo "Bad tag"; exit 1; fi   # the whole string, not one line of it
           echo "TAG=$TAG" >> "$GITHUB_ENV"; echo "Release: $TAG"
 
       - name: Download the Mac zips
